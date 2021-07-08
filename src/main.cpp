@@ -8,6 +8,7 @@
 #include "utils.h"
 
 #define  LED_WATCHDOG 2
+#define  MAX_DIAL_STRING 64
 
 #define STQ  15 // connect to Std pin
 #define Q1   16 // connect to Q4 pin
@@ -19,11 +20,13 @@ void wifiConnect();
 void connectToMqtt();
 void toggleLed();
 void detectDtmfTone();
+void dialNumber();
 
 Task wifiConnectTask(1000, TASK_ONCE, &wifiConnect);
 Task mqttReconnectTask(2000, TASK_ONCE, &connectToMqtt);
 Task toggleLedTask(1000, TASK_FOREVER, &toggleLed);
 Task dtmfToneTask(40, TASK_FOREVER, &detectDtmfTone);
+Task dialNumberTask(3000, TASK_ONCE, &dialNumber);
 
 WiFiManager wm;
 
@@ -31,13 +34,23 @@ WiFiManager wm;
 //WiFiManagerParameter mqtt_address_param; // global param ( for non blocking w params )
 char mqtt_server_str[40];
 char mqtt_port_str[6] = "8080";
+char dial_digits_str[6] = "32";
+char dial_timeout_str[6] = "3000";
 WiFiManagerParameter mqtt_address_param("server", "mqtt server", mqtt_server_str, 40);
 WiFiManagerParameter mqtt_port_param("port", "mqtt port", mqtt_port_str, 6);
+WiFiManagerParameter dial_digits_param("dial", "dial digits", dial_digits_str, 6);
+WiFiManagerParameter dial_timeout_param("dial", "dial timeout", dial_timeout_str, 6);
+
 Scheduler runner;
 std::vector<String> myQueue;
 
 AsyncMqttClient mqttClient;
 uint16 mqtt_port;
+uint16 dial_timeout;
+uint16 dial_digits;
+uint16 dial_count;
+uint16 old_dial_count;
+char dial_string[MAX_DIAL_STRING];
 
 char msg[256];
 uint16 signal_was;
@@ -56,7 +69,7 @@ void onMqttConnect(bool sessionPresent) {
   mqttReconnectTask.disable();
   runner.deleteTask(mqttReconnectTask);
   toggleLedTask.enable();
-  //dtmfToneTask.enable();
+  dtmfToneTask.enable();
   Serial.println("Connected to MQTT.");
   Serial.printf("Session present: %d\n", (int)sessionPresent);
 
@@ -64,7 +77,7 @@ void onMqttConnect(bool sessionPresent) {
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
 
-  //toggleLedTask.enable();
+  toggleLedTask.disable();
   dtmfToneTask.disable();
   Serial.printf("Disconnected from MQTT. %d\n", (int)reason);
   if (WiFi.isConnected()) {
@@ -113,7 +126,7 @@ void onMqttPublish(uint16_t packetId) {
   Serial.println(packetId);
 }
 
-void mqttPublish(String payload) {
+void mqttPublish(String topic, String payload) {
 
   if(!mqttClient.connected()){
     return;
@@ -125,10 +138,10 @@ void mqttPublish(String payload) {
 */
   void toggleLed(){
     digitalWrite(LED_WATCHDOG, !digitalRead(LED_WATCHDOG));
-    String payload = "|";
+    //String payload = "|";
     //mqttPublish(payload);
     //Serial.println("led toggled ...");
-    publish_dtmf_tone('|');
+    //publish_dtmf_tone('|');
     //Serial.println("led toggled ...");
   }
 
@@ -149,15 +162,19 @@ void wifiConnect() {
     runner.deleteTask(wifiConnectTask);
     WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
     //reset settings - wipe credentials for testing
-    //wm.resetSettings();
+    // wm.resetSettings();
     // set dark theme
     //wm.setClass("invert");
     // add a custom input field
     int customFieldLength = 40;
-    new (&mqtt_address_param) WiFiManagerParameter("mqtt_address_id", "MQTT Address", "192.168.1.200", customFieldLength,"placeholder=\"MQTT address Placeholder\"");
+    new (&mqtt_address_param) WiFiManagerParameter("mqtt_address_id", "MQTT Address", "10.130.1.100", customFieldLength,"placeholder=\"MQTT address Placeholder\"");
     wm.addParameter(&mqtt_address_param);
     new (&mqtt_port_param) WiFiManagerParameter("mqtt_port_id", "MQTT Port", "1883", customFieldLength,"placeholder=\"MQTT port Placeholder\"");
     wm.addParameter(&mqtt_port_param);
+    new (&dial_timeout_param) WiFiManagerParameter("dial_timeout_id", "Dial Timeout", "1000", customFieldLength,"placeholder=\"Dial Timeout Placeholder\"");
+    wm.addParameter(&dial_timeout_param);
+    new (&dial_digits_param) WiFiManagerParameter("dial_digits_id", "Number Digit Port", "32", customFieldLength,"placeholder=\"Dial Digits Placeholder\"");
+    wm.addParameter(&dial_digits_param);
     //wm.setSaveParamsCallback(saveParamCallback);
     // auto generated AP name from chipid with password
     bool ret;
@@ -171,6 +188,8 @@ void wifiConnect() {
       IPAddress ip;
       ip.fromString(mqtt_address_param.getValue());
       mqtt_port = atoi(mqtt_port_param.getValue());
+      dial_timeout =  atoi(dial_timeout_param.getValue());
+      dial_digits = atoi(dial_digits_param.getValue());
       //Serial.println("connected3");
       sprintf(msg, "Try to connect to MQTT broker address %s:%d", mqtt_address.c_str(), mqtt_port);
       Serial.println(msg);
@@ -188,9 +207,31 @@ void wifiConnect() {
    doc["timestamp"]=str;
    doc["dtmf_key"]=String(key);
    serializeJson(doc, payload);
-   mqttPublish(payload);
+   mqttPublish("ksoft/event/dtmf", payload);
 
  }
+
+void publish_dial_number(){
+    StaticJsonDocument<200> doc;
+    char str[18] = "";
+    Utils::timeToString(str, sizeof(str));
+    String payload;
+    doc["timestamp"]=str;
+
+    if (dial_count > MAX_DIAL_STRING) {
+        dial_count = 0;
+    }
+
+    dial_string[dial_count] = 0;
+
+    doc["dial_number"]=String(dial_string);
+    serializeJson(doc, payload);
+    mqttPublish("ksoft/event/dial", payload);
+
+    dial_count = 0;
+}
+
+
 
  void detectDtmfTone(){
     uint8_t number_pressed;
@@ -255,12 +296,35 @@ void wifiConnect() {
           key = '?';
       }
       publish_dtmf_tone(key);
-
+      dial_string[dial_count] = key;
+      if(dial_count == 0){
+        dialNumberTask.enable();
+        dialNumberTask.setIterations(TASK_FOREVER);
+        dialNumberTask.delay(1000);
+      }
+      dial_count++;
+      if (dial_count >= dial_digits) {
+        dialNumberTask.disable();
+        publish_dial_number();
+      }
     } else if (signal == LOW) {
       signal_was = LOW;
     }
   }
  /**************/
+ void dialNumber(){
+
+   /* */
+   if (dial_count > MAX_DIAL_STRING) {
+     dial_count = MAX_DIAL_STRING;
+   }
+   if (dial_count == old_dial_count){
+      publish_dial_number();
+      dialNumberTask.disable();
+   }
+   old_dial_count = dial_count;
+
+ }
 
 
  void setup() {
@@ -272,7 +336,8 @@ void wifiConnect() {
        pinMode(Q2, INPUT); // connect to Q2 pin
        pinMode(Q1, INPUT); // connect to Q1 pin
        signal_was = LOW;
-
+       dial_count = 0;
+       old_dial_count = 0;
        digitalWrite(LED_WATCHDOG, !digitalRead(LED_WATCHDOG));
        Serial.begin(115200);
        mqttClient.onConnect(onMqttConnect);
@@ -281,7 +346,7 @@ void wifiConnect() {
        mqttClient.onUnsubscribe(onMqttUnsubscribe);
        mqttClient.onMessage(onMqttMessage);
        mqttClient.onPublish(onMqttPublish);
-      Serial.println("Initialized mqtt");
+       Serial.println("Initialized mqtt");
 
        runner.init();
        Serial.println("Initialized scheduler");
@@ -291,6 +356,7 @@ void wifiConnect() {
        runner.addTask(mqttReconnectTask);
        runner.addTask(toggleLedTask);
        runner.addTask(dtmfToneTask);
+       runner.addTask(dialNumberTask);
 
        Serial.println("Ksoft tone spy started");
 
